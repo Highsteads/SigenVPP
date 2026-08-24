@@ -1,0 +1,31 @@
+{
+  "inverter": {
+    "ip": "192.168.1.50",
+    "port": 502,
+    "plant_address": 247,
+    "inverter_slave_id": 1
+  },
+  "vpp": {
+    "axle_token": "PASTE-YOUR-AXLE-BEARER-TOKEN-HERE",
+    "export_target_kw": 4.0,
+    "inverter_max_kw": 10.0,
+    "battery_capacity_kwh": 0.0,
+    "reserve_floor_pct": 10.0,
+    "health_floor_pct": 1.0,
+    "precharge_lead_min": 30,
+    "start_lead_min": 2,
+    "end_trail_min": 2,
+    "poll_interval_min": 10,
+    "poll_modbus_s": 5,
+    "rate_per_kwh": 1.0
+  },
+  "notify": {
+    "pushover_token": "",
+    "pushover_user": ""
+  },
+  "web": {
+    "enabled": true,
+    "bind": "0.0.0.0",
+    "port": 8179
+  }
+}

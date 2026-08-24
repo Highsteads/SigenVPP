@@ -1,0 +1,10 @@
+config.json
+*.log
+data/
+vpp_events/
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+.venv/
+venv/
