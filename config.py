@@ -42,7 +42,8 @@ DEFAULTS = {
     },
     "web": {
         "enabled": True,
-        "bind":    "0.0.0.0",   # LAN bind; never port-forward this to the internet
+        "bind":    "127.0.0.1",  # this machine only. "0.0.0.0" opens it to the whole
+                                # LAN with no auth - deliberate choice, not a default
         "port":    8179,
     },
 }

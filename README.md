@@ -84,9 +84,17 @@ SOC, and the next event. It's the page you'd leave open to watch an event run.
 
 ## Security
 
-`config.json` holds your Axle token (and any Pushover keys) — it is written `chmod 600` and
-must never be committed. Keep the (future) web UI **LAN-only** and behind auth before exposing
-any control; never port-forward it to the internet.
+`config.json` holds your Axle token (and any Pushover keys). It is written `chmod 600` and
+must never be committed — `.gitignore` covers it.
+
+The web dashboard binds to **127.0.0.1 by default**, so it is reachable only from the machine
+running the daemon. It has no authentication, and `/api/status` carries the whole system state
+— battery SOC, grid flow, the VPP schedule — so widening `web.bind` to `0.0.0.0` publishes all
+of that to anyone on your network. That is a deliberate choice to make, not a default to
+inherit.
+
+Never forward the port from your router. If you want the dashboard from elsewhere, put it
+behind Tailscale or a Cloudflare Tunnel, neither of which needs an open port.
 
 ## What's here
 

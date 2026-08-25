@@ -32,7 +32,7 @@ def _json_safe(obj):
 class WebDashboard:
     """Threaded stdlib web server. `provider()` returns the live status dict."""
 
-    def __init__(self, provider, host="0.0.0.0", port=8179,
+    def __init__(self, provider, host="127.0.0.1", port=8179,
                  logger=None, title="SigenVPP"):
         self.provider = provider
         self.host     = host
@@ -73,6 +73,11 @@ class WebDashboard:
             daemon_threads = True
             allow_reuse_address = True
 
+        # Loopback by default. This page and /api/status carry the whole system
+        # state - SOC, grid flow, VPP schedule - and there is no authentication
+        # here, so binding every interface would publish all of it to the LAN.
+        # Widen it deliberately in config.json if you want it from another
+        # machine, and put it behind Tailscale rather than a forwarded port.
         self._httpd = Server((self.host, self.port), Handler)
         self._thread = threading.Thread(target=self._httpd.serve_forever,
                                         name="SigenVPP-web", daemon=True)
