@@ -4,7 +4,7 @@
 # Description: Axle VPP REST API client - polls for export event schedule
 # Author:      CliveS & Claude Fable 5
 # Date:        30-07-2026
-# Version:     1.4
+# Version:     1.5
 #
 # Adapted from SigenergySolar v3.1 axle_api.py
 # Changes: Updated logger name to SigenEnergyManager; _parse_dt guards non-string input
@@ -13,6 +13,10 @@
 #          v1.4 — an all-null event object is "no event scheduled", not a fault.
 #          Axle returns that shape once an event ends; it is truthy, so it used
 #          to reach the malformed branch and report a failure every 10 minutes.
+#          v1.5 — the three "no event scheduled" lines drop to DEBUG. A quiet
+#          feed is the normal state, so at INFO they wrote ~140 lines a day to
+#          the Indigo event log saying nothing had happened. Failures still log
+#          at ERROR/WARNING, so an unhealthy feed is as visible as it ever was.
 
 import logging
 import requests
@@ -119,7 +123,7 @@ class AxleAPI:
                 return None
 
             if response.status_code == 204 or not response.content:
-                self.logger.info("Axle poll: no event scheduled (204 / empty body)")
+                self.logger.debug("Axle poll: no event scheduled (204 / empty body)")
                 return None
 
             try:
@@ -130,7 +134,7 @@ class AxleAPI:
                 return None
 
             if not data:
-                self.logger.info("Axle poll: no event scheduled (null response)")
+                self.logger.debug("Axle poll: no event scheduled (null response)")
                 return None
 
             # Axle says "no event scheduled" in TWO shapes. A null body (above),
@@ -147,7 +151,7 @@ class AxleAPI:
             # and still an error — that distinction is the point of doing this
             # here rather than widening the guard below.
             if data.get("start_time") is None and data.get("end_time") is None:
-                self.logger.info("Axle poll: no event scheduled (all-null event object)")
+                self.logger.debug("Axle poll: no event scheduled (all-null event object)")
                 return None
 
             start_time = self._parse_dt(data.get("start_time"))
