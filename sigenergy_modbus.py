@@ -4,8 +4,14 @@
 # Description: Sigenergy inverter Modbus TCP client - reads all registers
 #              and controls battery via Remote EMS
 # Author:      CliveS & Claude Opus 5
-# Date:        24-08-2026
-# Version:     1.12 (read_export_limit() — reads back the commissioned grid
+# Date:        03-09-2026
+# Version:     1.13 (READ TIERING — read_all did 29 transactions at the spec's
+#              1s spacing, so a poll took 43s MEASURED however pollInterval was
+#              set, and the flow figures came from instants seconds apart while
+#              homePowerWatts is derived from three of them. Critical reads now
+#              run every cycle with PV+ESS sharing ONE block read; the rest
+#              rotate behind a cache. Same dict out, ~8 transactions in.)
+#              prior 1.12 (read_export_limit() — reads back the commissioned grid
 #              export cap 40038; the write side already existed)
 #              prior 1.11 (REAL grid voltage 31011 + current 31017, rated capacity
 #              30548 — the nameplate/measurement distinction again)
@@ -294,6 +300,59 @@ def decode_pv_strings(regs):
     return out
 
 
+# --- Read tiering (v1.13, 03-09-2026) --------------------------------------
+# Every register used to be read every cycle. The Sigenergy protocol wants a
+# 1 s gap between requests, so 29 reads made one poll take ~43 s MEASURED
+# LIVE, whatever pollInterval was set to. Two consequences, both visible on
+# the dashboards:
+#
+#   * the flow figures were up to ~40 s stale, and
+#   * they came from DIFFERENT POINTS in that sweep — grid at ~+3 s, PV at
+#     ~+6 s, battery at ~+7 s — while homePowerWatts is CALCULATED from all
+#     three, so it absorbed the whole skew. On 03-09-2026, a broken-cloud day
+#     where PV moved up to 5.7 kW between samples, 1% of daylight house
+#     readings fell below 150 W and one hit 0 W, against an overnight minimum
+#     of 373 W when nothing was moving.
+#
+# Now: the six CRITICAL_KEYS are read EVERY cycle, ordered so the three power
+# figures land within a second of each other, with PV and battery sharing ONE
+# block read and therefore one instant. Everything else is read
+# SLOW_READS_PER_CYCLE at a time, round-robin, its last good value cached and
+# merged in — so read_all()'s returned dict is unchanged in shape and every
+# consumer is untouched. ~8 transactions a cycle instead of 29.
+SLOW_READS_PER_CYCLE = 3
+
+# A cached slow value is a real reading that is merely old, so it is safe to
+# serve — but not for ever. A register that has failed for this long is not
+# "slightly stale", it is absent, and its key is dropped so consumers see the
+# gap rather than an hour-old number presented as current.
+SLOW_CACHE_MAX_AGE_S = 600
+
+
+def decode_s32_pair(regs):
+    """Decode 4 raw U16 words into two signed 32-bit values.
+
+    The 30035 block carries PV power then ESS power as consecutive S32s, so
+    one transaction gives both from the SAME instant — which is the whole
+    point, homePowerWatts being derived from them. Word order and sign
+    handling match _read_int32 exactly: high word first, >= 2**31 wraps
+    negative. Returns None for a short or malformed block rather than a
+    half-decoded pair.
+    """
+    if not regs or len(regs) < 4:
+        return None
+    try:
+        out = []
+        for i in (0, 2):
+            v = (int(regs[i]) << 16) | int(regs[i + 1])
+            if v >= 2147483648:
+                v -= 4294967296
+            out.append(v)
+        return tuple(out)
+    except (TypeError, ValueError):
+        return None
+
+
 def _locked(fn):
     """Serialise a primitive on the instance's RLock.
 
@@ -362,6 +421,17 @@ class SigenergyModbus:
         # debug line — every cycle for ever. A restart re-probes.
         self._pv_strings_absent    = False
         self._pv_strings_misses    = 0
+
+        # Read tiering (v1.13). _slow_cache holds the last good value of every
+        # slow register with the monotonic time it was read; _slow_cursor is
+        # the round-robin position; _slow_primed is False until one full sweep
+        # has happened, so the very first snapshot after a connect carries
+        # every key rather than a handful. _slow_due is the "read this next,
+        # whatever the rotation says" set, used after a control write.
+        self._slow_cache   = {}
+        self._slow_cursor  = 0
+        self._slow_primed  = False
+        self._slow_due     = set()
         # sleep_func: callable taking seconds. When called from a plugin thread,
         # pass plugin.sleep so StopThread can interrupt the 1s throttle delay
         # between Modbus requests (read_all does ~16 reads = up to 16s blocking).
@@ -689,10 +759,168 @@ class SigenergyModbus:
     # Main Read Function
     # ================================================================
 
-    def read_all(self):
-        """Read all key registers and return a data dict.
+    def _read_pv_strings(self, data):
+        """Per-PV-string block (v1.8) — one transaction for all four V/I pairs.
 
-        Returns None if connection fails (too many errors).
+        NON-critical by design: a failure costs the pvStrings key this cycle,
+        never the snapshot. The absent-latch stops an install whose firmware
+        lacks the block from paying a failing throttled read every cycle.
+        Returns True when a reading landed.
+        """
+        string_regs = self._read_block_u16(
+            INV_PV_STRING_BLOCK, INV_PV_STRING_BLOCK_COUNT,
+            slave=self.inverter_address)
+        if string_regs is not None:
+            data["pvStrings"] = decode_pv_strings(string_regs)
+            self._pv_strings_misses = 0
+            return True
+        if self._connected:
+            # The link is up and only this block failed — count it as a real
+            # "register absent" strike, not an outage symptom.
+            self._pv_strings_misses += 1
+            if self._pv_strings_misses >= 3:
+                self._pv_strings_absent = True
+                self.logger.info(
+                    "Per-PV-string registers (31025+) not answering on "
+                    "this inverter — per-string readings disabled until "
+                    "the next plugin restart.")
+        return False
+
+    def _slow_read_specs(self):
+        """The registers that do NOT need reading every cycle.
+
+        Each entry is (key, reader, register, slave, post). `post` maps the
+        raw value to what goes in the dict, or returns None for "no usable
+        reading" — which counts as an error and leaves the previous cached
+        value in place. Every transform here is exactly what read_all did
+        inline before v1.13; this is a change of WHEN they are read, not of
+        what they mean.
+
+        The list is also the rotation order. pvStrings is omitted once the
+        absent-latch engages, so `attempted` stays honest.
+        """
+        inv = self.inverter_address
+        specs = [
+            # Plant, slow-moving
+            ("emsWorkMode", self._read_uint16, PLANT_EMS_WORK_MODE, None,
+             lambda v: EMS_MODES.get(v, f"Unknown ({v})")),
+            ("gridSensorConnected", self._read_uint16, PLANT_GRID_SENSOR_STATUS, None,
+             lambda v: (v == 1)),
+            ("dischargeCutoffSoc", self._read_uint16, PLANT_ESS_DISCHARGE_CUTOFF, None,
+             lambda v: round(v / 10.0, 1)),
+            ("batterySoh", self._read_uint16, PLANT_ESS_SOH, None,
+             lambda v: round(v / 10.0, 1)),
+            # Inverter: battery pack
+            ("batteryDailyChargeKwh", self._read_uint32, INV_DAILY_CHARGE_ENERGY, inv,
+             lambda v: round(v / 100.0, 2)),
+            ("batteryDailyDischargeKwh", self._read_uint32, INV_DAILY_DISCHARGE_ENERGY, inv,
+             lambda v: round(v / 100.0, 2)),
+            ("batteryTempC", self._read_int16, INV_BATTERY_AVG_TEMP, inv,
+             lambda v: round(v / 10.0, 1)),
+            ("batteryCellVoltage", self._read_uint16, INV_BATTERY_AVG_VOLTAGE, inv,
+             lambda v: round(v / 1000.0, 3)),
+            ("batteryMaxTempC", self._read_int16, INV_BATTERY_MAX_TEMP, inv,
+             lambda v: round(v / 10.0, 1)),
+            ("batteryMinTempC", self._read_int16, INV_BATTERY_MIN_TEMP, inv,
+             lambda v: round(v / 10.0, 1)),
+            # Inverter: self-diagnostics, all named from the official V2.7
+            # protocol. Every one is NON-critical.
+            ("gridFrequencyHz", self._read_uint16, INV_GRID_FREQUENCY_HZ, inv,
+             lambda v: round(v / 100.0, 2)),
+            ("pcsInternalTempC", self._read_int16, INV_PCS_INTERNAL_TEMP_C, inv,
+             lambda v: round(v / 10.0, 1)),
+            ("insulationResistanceMohm", self._read_uint16, INV_INSULATION_RESISTANCE, inv,
+             lambda v: round(v / 1000.0, 3)),
+            ("packCount", self._read_uint16, INV_PACK_COUNT, inv,
+             lambda v: v),
+            ("alarm1Raw", self._read_uint16, INV_ALARM1, inv,
+             lambda v: v),
+            ("ratedCapacityKwh", self._read_uint32, INV_RATED_CAPACITY_KWH, inv,
+             lambda v: round(v / 100.0, 2)),
+            # 0xFFFFFFFF is this firmware's "not applicable" for an unused
+            # phase, and it decodes to a nonsense 42949672.95 V at face value.
+            ("gridVoltageV", self._read_uint32, INV_PHASE_A_VOLTAGE, inv,
+             lambda v: None if v == 0xFFFFFFFF else round(v / 100.0, 2)),
+            ("gridCurrentA", self._read_uint32, INV_PHASE_A_CURRENT, inv,
+             lambda v: None if v == 0xFFFFFFFF else round(v / 100.0, 2)),
+            # Plant energy. pvLifetimeKwh / gridImport / gridExport are
+            # LIFETIME totals; plugin.py computes daily values as
+            # (current - start-of-day snapshot). homeDailyDirectKwh (30092)
+            # resets at midnight on the inverter — read directly.
+            ("pvLifetimeKwh", self._read_uint64, PLANT_PV_TOTAL_KWH, None,
+             lambda v: round(v / 100.0, 2)),
+            ("homeDailyDirectKwh", self._read_uint32, PLANT_LOAD_DAILY_KWH, None,
+             lambda v: round(v / 100.0, 2)),
+            ("gridImportLifetimeKwh", self._read_uint64, PLANT_TOTAL_IMPORT_KWH, None,
+             lambda v: round(v / 100.0, 2)),
+            ("gridExportLifetimeKwh", self._read_uint64, PLANT_TOTAL_EXPORT_KWH, None,
+             lambda v: round(v / 100.0, 2)),
+        ]
+        if not self._pv_strings_absent:
+            specs.append(("pvStrings", None, None, None, None))
+        return specs
+
+    def mark_slow_read_due(self, *keys):
+        """Force these slow registers to be re-read on the very next poll.
+
+        For use after a control write, so a cached emsWorkMode or cutoff SOC
+        cannot outlive the thing that changed it. Cheap: it adds those reads
+        to the next cycle, it does not trigger a full sweep.
+        """
+        self._slow_due.update(keys)
+
+    def _run_slow_reads(self, data, force_full=False):
+        """Read the slow registers that are due. Returns (attempted, errors).
+
+        A full sweep runs when asked, and on the first cycle after a connect
+        so the very first snapshot carries every key rather than a handful.
+        Otherwise: anything explicitly marked due, then the rotation, capped
+        at SLOW_READS_PER_CYCLE so no cycle can grow back towards 29 reads.
+        """
+        specs = self._slow_read_specs()
+        n = len(specs)
+        if n == 0:
+            return 0, 0
+        full = force_full or not self._slow_primed
+        if full:
+            due = list(range(n))
+        else:
+            by_key = {sp[0]: i for i, sp in enumerate(specs)}
+            due = [by_key[k] for k in sorted(self._slow_due) if k in by_key]
+            for step in range(min(SLOW_READS_PER_CYCLE, n)):
+                idx = (self._slow_cursor + step) % n
+                if idx not in due:
+                    due.append(idx)
+            self._slow_cursor = (self._slow_cursor + min(SLOW_READS_PER_CYCLE, n)) % n
+        self._slow_due.clear()
+
+        errors = 0
+        for idx in due:
+            key, reader, register, slave, post = specs[idx]
+            if key == "pvStrings":
+                if self._read_pv_strings(data):
+                    self._slow_cache[key] = (data[key], time.monotonic())
+                else:
+                    errors += 1
+                continue
+            raw = reader(register) if slave is None else reader(register, slave=slave)
+            value = None if raw is None else post(raw)
+            if value is None:
+                errors += 1
+            else:
+                data[key] = value
+                self._slow_cache[key] = (value, time.monotonic())
+        return len(due), errors
+
+    def read_all(self, force_full=False):
+        """Read the current registers and return a data dict.
+
+        Returns None if connection fails (too many errors) or if a critical
+        register failed this cycle.
+
+        Since v1.13 this is TIERED — see the "Read tiering" note above. The
+        returned dict is unchanged in shape: slow values not read this cycle
+        are merged from cache. Pass force_full=True for a complete sweep.
 
         Data keys returned:
           emsWorkMode, gridSensorConnected, gridPowerWatts, gridStatus,
@@ -712,47 +940,15 @@ class SigenergyModbus:
         plant_errors = 0
         inv_errors   = 0
 
-        # --- Phase A: Plant reads (slave 247) ---
-
-        ems_mode = self._read_uint16(PLANT_EMS_WORK_MODE)
-        if ems_mode is not None:
-            data["emsWorkMode"] = EMS_MODES.get(ems_mode, f"Unknown ({ems_mode})")
-        else:
-            plant_errors += 1
-
-        grid_sensor = self._read_uint16(PLANT_GRID_SENSOR_STATUS)
-        if grid_sensor is not None:
-            data["gridSensorConnected"] = (grid_sensor == 1)
-        else:
-            plant_errors += 1
-
-        grid_power = self._read_int32(PLANT_GRID_ACTIVE_POWER)
-        if grid_power is not None:
-            data["gridPowerWatts"] = grid_power
-        else:
-            plant_errors += 1
-
-        grid_status = self._read_uint16(PLANT_ON_OFF_GRID_STATUS)
-        if grid_status is not None:
-            data["gridStatus"] = GRID_STATUSES.get(grid_status, f"Unknown ({grid_status})")
-        else:
-            plant_errors += 1
+        # --- Fast tier: every cycle ---
+        # Ordered so the three power figures land within a second of each
+        # other, and so PV and battery come from ONE block read and therefore
+        # ONE instant. homePowerWatts is derived from all three, so any spread
+        # here lands in the house figure and nowhere else.
 
         batt_soc = self._read_uint16(PLANT_BATTERY_SOC)
         if batt_soc is not None:
             data["batterySoc"] = round(batt_soc / 10.0, 1)
-        else:
-            plant_errors += 1
-
-        pv_power = self._read_int32(PLANT_PV_POWER)
-        if pv_power is not None:
-            data["pvPowerWatts"] = max(0, pv_power)
-        else:
-            plant_errors += 1
-
-        batt_power = self._read_int32(PLANT_ESS_POWER)
-        if batt_power is not None:
-            data["batteryPowerWatts"] = batt_power
         else:
             plant_errors += 1
 
@@ -764,185 +960,64 @@ class SigenergyModbus:
         else:
             plant_errors += 1
 
-        cutoff_soc = self._read_uint16(PLANT_ESS_DISCHARGE_CUTOFF)
-        if cutoff_soc is not None:
-            data["dischargeCutoffSoc"] = round(cutoff_soc / 10.0, 1)
+        grid_status = self._read_uint16(PLANT_ON_OFF_GRID_STATUS)
+        if grid_status is not None:
+            data["gridStatus"] = GRID_STATUSES.get(grid_status, f"Unknown ({grid_status})")
         else:
             plant_errors += 1
 
-        batt_soh = self._read_uint16(PLANT_ESS_SOH)
-        if batt_soh is not None:
-            data["batterySoh"] = round(batt_soh / 10.0, 1)
+        grid_power = self._read_int32(PLANT_GRID_ACTIVE_POWER)
+        if grid_power is not None:
+            data["gridPowerWatts"] = grid_power
         else:
             plant_errors += 1
 
-        # --- Phase B: Inverter reads (configurable slave address) ---
-
-        inv_addr = self.inverter_address
-
-        daily_charge = self._read_uint32(INV_DAILY_CHARGE_ENERGY, slave=inv_addr)
-        if daily_charge is not None:
-            data["batteryDailyChargeKwh"] = round(daily_charge / 100.0, 2)
-        else:
-            inv_errors += 1
-
-        daily_discharge = self._read_uint32(INV_DAILY_DISCHARGE_ENERGY, slave=inv_addr)
-        if daily_discharge is not None:
-            data["batteryDailyDischargeKwh"] = round(daily_discharge / 100.0, 2)
-        else:
-            inv_errors += 1
-
-        batt_temp = self._read_int16(INV_BATTERY_AVG_TEMP, slave=inv_addr)
-        if batt_temp is not None:
-            data["batteryTempC"] = round(batt_temp / 10.0, 1)
-        else:
-            inv_errors += 1
-
-        batt_voltage = self._read_uint16(INV_BATTERY_AVG_VOLTAGE, slave=inv_addr)
-        if batt_voltage is not None:
-            data["batteryCellVoltage"] = round(batt_voltage / 1000.0, 3)
-        else:
-            inv_errors += 1
-
-        batt_max_temp = self._read_int16(INV_BATTERY_MAX_TEMP, slave=inv_addr)
-        if batt_max_temp is not None:
-            data["batteryMaxTempC"] = round(batt_max_temp / 10.0, 1)
-        else:
-            inv_errors += 1
-
-        batt_min_temp = self._read_int16(INV_BATTERY_MIN_TEMP, slave=inv_addr)
-        if batt_min_temp is not None:
-            data["batteryMinTempC"] = round(batt_min_temp / 10.0, 1)
-        else:
-            inv_errors += 1
-
-        # Grid frequency (v1.9). NON-critical: a failure costs this key, never
-        # the snapshot. Worth having beside the VPP work — a grid event is
-        # ultimately a frequency problem, so this is the quantity the whole
-        # scheme exists to defend.
-        grid_hz = self._read_uint16(INV_GRID_FREQUENCY_HZ, slave=inv_addr)
-        if grid_hz is not None:
-            data["gridFrequencyHz"] = round(grid_hz / 100.0, 2)
-        else:
-            inv_errors += 1
-
-        # Inverter self-diagnostics (v1.10), all named from the official V2.7
-        # protocol. Every one is NON-critical: a failure costs its own key and
-        # never the snapshot.
-        pcs_temp = self._read_int16(INV_PCS_INTERNAL_TEMP_C, slave=inv_addr)
-        if pcs_temp is not None:
-            data["pcsInternalTempC"] = round(pcs_temp / 10.0, 1)
-        else:
-            inv_errors += 1
-
-        insul = self._read_uint16(INV_INSULATION_RESISTANCE, slave=inv_addr)
-        if insul is not None:
-            data["insulationResistanceMohm"] = round(insul / 1000.0, 3)
-        else:
-            inv_errors += 1
-
-        packs = self._read_uint16(INV_PACK_COUNT, slave=inv_addr)
-        if packs is not None:
-            data["packCount"] = packs
-        else:
-            inv_errors += 1
-
-        alarm1 = self._read_uint16(INV_ALARM1, slave=inv_addr)
-        if alarm1 is not None:
-            data["alarm1Raw"] = alarm1
-        else:
-            inv_errors += 1
-
-        rated = self._read_uint32(INV_RATED_CAPACITY_KWH, slave=inv_addr)
-        if rated is not None:
-            data["ratedCapacityKwh"] = round(rated / 100.0, 2)
-        else:
-            inv_errors += 1
-
-        volts = self._read_uint32(INV_PHASE_A_VOLTAGE, slave=inv_addr)
-        # 0xFFFFFFFF is this firmware's "not applicable" for an unused phase,
-        # and it decodes to a nonsense 42949672.95 V if taken at face value.
-        if volts is not None and volts != 0xFFFFFFFF:
-            data["gridVoltageV"] = round(volts / 100.0, 2)
-        else:
-            inv_errors += 1
-
-        amps = self._read_uint32(INV_PHASE_A_CURRENT, slave=inv_addr)
-        if amps is not None and amps != 0xFFFFFFFF:
-            data["gridCurrentA"] = round(amps / 100.0, 2)
-        else:
-            inv_errors += 1
-
-        # Per-PV-string block (v1.8) — one transaction for all four V/I pairs.
-        # NON-critical by design: a failure costs the pvStrings key this cycle,
-        # never the snapshot. The absent-latch stops an install whose firmware
-        # lacks the block from paying a failing throttled read every cycle.
-        if not self._pv_strings_absent:
-            string_regs = self._read_block_u16(
-                INV_PV_STRING_BLOCK, INV_PV_STRING_BLOCK_COUNT, slave=inv_addr)
-            if string_regs is not None:
-                data["pvStrings"] = decode_pv_strings(string_regs)
-                self._pv_strings_misses = 0
-            else:
-                inv_errors += 1
-                if self._connected:
-                    # The link is up and only this block failed — count it as
-                    # a real "register absent" strike, not an outage symptom.
-                    self._pv_strings_misses += 1
-                    if self._pv_strings_misses >= 3:
-                        self._pv_strings_absent = True
-                        self.logger.info(
-                            "Per-PV-string registers (31025+) not answering on "
-                            "this inverter — per-string readings disabled until "
-                            "the next plugin restart.")
-
-        # --- Phase D: Plant daily/lifetime energy registers ---
-        # pvLifetimeKwh / gridImportLifetimeKwh / gridExportLifetimeKwh are LIFETIME
-        # totals; plugin.py computes daily values as (current - start-of-day snapshot).
-        # homeDailyDirectKwh (30092) resets at midnight on the inverter — read directly.
-
-        pv_total = self._read_uint64(PLANT_PV_TOTAL_KWH)
-        if pv_total is not None:
-            data["pvLifetimeKwh"] = round(pv_total / 100.0, 2)
+        # 30035-30038: PV power then ESS power, four consecutive DEFINED
+        # registers, so the block is safe — a block containing an undefined
+        # address fails whole.
+        pv_ess = self._read_block_u16(PLANT_PV_POWER, 4)
+        pair   = decode_s32_pair(pv_ess)
+        if pair is not None:
+            data["pvPowerWatts"]      = max(0, pair[0])
+            data["batteryPowerWatts"] = pair[1]
         else:
             plant_errors += 1
+        fast_reads = 5
 
-        load_daily = self._read_uint32(PLANT_LOAD_DAILY_KWH)
-        if load_daily is not None:
-            data["homeDailyDirectKwh"] = round(load_daily / 100.0, 2)
-        else:
-            plant_errors += 1
-
-        import_total = self._read_uint64(PLANT_TOTAL_IMPORT_KWH)
-        if import_total is not None:
-            data["gridImportLifetimeKwh"] = round(import_total / 100.0, 2)
-        else:
-            plant_errors += 1
-
-        export_total = self._read_uint64(PLANT_TOTAL_EXPORT_KWH)
-        if export_total is not None:
-            data["gridExportLifetimeKwh"] = round(export_total / 100.0, 2)
-        else:
-            plant_errors += 1
+        # --- Slow tier: rotated, cached ---
+        full_sweep = force_full or not self._slow_primed
+        slow_reads, slow_errors = self._run_slow_reads(data, force_full=force_full)
+        inv_errors += slow_errors
 
         # --- Connection quality check ---
 
-        # read_all issues this many register reads per cycle (Phase A=10, B=15
-        # incl. the per-string block, D=4). Keep in step if reads are
-        # added/removed so the "more than half failed" disconnect threshold and
-        # the error-ratio log lines stay self-consistent. Once the per-string
-        # absent-latch engages the real count drops back to 20 — acceptable
-        # slack in a >half threshold, not worth a moving constant.
-        TOTAL_READS  = 29
+        attempted    = fast_reads + slow_reads
         total_errors = plant_errors + inv_errors
-        if total_errors > TOTAL_READS // 2:  # more than half of the reads failed
+        # More than half of this cycle's transactions failed. The floor of 3
+        # matters now that a routine cycle is ~8 reads rather than 29: without
+        # it, two transient failures out of five would drop the connection
+        # where the old cycle needed fifteen.
+        if total_errors > max(3, attempted // 2):
             self.logger.error(
-                f"Too many Modbus errors ({total_errors}/{TOTAL_READS}) - marking disconnected")
+                f"Too many Modbus errors ({total_errors}/{attempted}) - marking disconnected")
             self._connected = False
             # Stamp the attempt clock so the next poll honours the reconnect
             # delay instead of instantly re-running a failed cycle.
             self._last_connect_attempt = time.monotonic()
             return None
+
+        # Merge cached slow values for anything not read this cycle. A cached
+        # value is a real reading that is merely old, which is fine — but one
+        # that has failed for SLOW_CACHE_MAX_AGE_S is not stale, it is absent,
+        # so its key is dropped and consumers see the gap instead of an
+        # hour-old number presented as current.
+        now = time.monotonic()
+        for key in list(self._slow_cache):
+            value, when = self._slow_cache[key]
+            if now - when > SLOW_CACHE_MAX_AGE_S:
+                del self._slow_cache[key]
+                continue
+            data.setdefault(key, value)
 
         # Critical-register guard. A partial read drops the failed key entirely;
         # every consumer then does .get("batterySoc", 0.0), so a single transient
@@ -952,6 +1027,8 @@ class SigenergyModbus:
         # this cycle, return None so _poll_modbus keeps the last-known-good snapshot
         # instead of acting on fabricated zeros. The connection is healthy, so we
         # do NOT flip self._connected — the next poll retries normally.
+        # Every one of these is in the FAST tier, so none can be served from
+        # cache and none can be older than this cycle.
         CRITICAL_KEYS = (
             "batterySoc", "gridPowerWatts", "batteryPowerWatts",
             "pvPowerWatts", "plantRunningState", "gridStatus",
@@ -960,7 +1037,7 @@ class SigenergyModbus:
         if missing_critical:
             self.logger.warning(
                 f"Partial Modbus read — critical register(s) missing "
-                f"{missing_critical} ({total_errors}/{TOTAL_READS} errors); keeping "
+                f"{missing_critical} ({total_errors}/{attempted} errors); keeping "
                 f"last-known-good snapshot this cycle (not acting on partial data)."
             )
             return None
@@ -974,6 +1051,9 @@ class SigenergyModbus:
         data["modbusConnected"] = True
         data["lastUpdate"]      = datetime.now().strftime("%H:%M:%S")
 
+        if full_sweep:
+            self._slow_primed = True
+
         if total_errors > 0:
             self.logger.debug(
                 f"Read complete with {total_errors} error(s) "
@@ -981,7 +1061,6 @@ class SigenergyModbus:
             )
 
         return data
-
     # ================================================================
     # Low-Level Write Primitives
     # ================================================================
@@ -1129,6 +1208,11 @@ class SigenergyModbus:
         success = self._write_single_register(HOLD_REMOTE_EMS_MODE, mode)
         if not success:
             self.logger.error(f"Failed to set Remote EMS mode: {mode_name}")
+        else:
+            # emsWorkMode is a SLOW read since v1.13, so without this the
+            # snapshot could report the old mode for a full rotation after
+            # the write that changed it.
+            self.mark_slow_read_due("emsWorkMode")
         return success
 
     def set_charge_limit(self, watts, quiet=False):
@@ -1423,6 +1507,8 @@ class SigenergyModbus:
         success = self._write_single_register(HOLD_ESS_DISCHARGE_CUTOFF, raw_value)
         if not success:
             self.logger.error(f"Failed to set discharge cutoff to {soc_pct:.1f}%")
+        else:
+            self.mark_slow_read_due("dischargeCutoffSoc")
         return success
 
     def read_discharge_cutoff(self):
