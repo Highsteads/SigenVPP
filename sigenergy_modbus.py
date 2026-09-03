@@ -229,6 +229,21 @@ GRID_STATUSES = {
 MIN_REQUEST_INTERVAL = 1.0
 
 
+# Physical bounds for one PV string on a residential inverter. Anything
+# outside these means the block did not decode to what we think it is, so
+# nothing in it can be trusted — see decode_pv_strings.
+PV_STRING_MAX_VOLTS = 1500.0    # Sigenergy max PV input is 1000 V DC
+PV_STRING_MAX_AMPS  = 100.0     # per-MPPT max input current is ~16-32 A
+
+
+def _s16(word):
+    """Reinterpret one raw Modbus word as a SIGNED 16-bit integer."""
+    value = int(word)
+    if value >= 32768:
+        value -= 65536
+    return value
+
+
 def decode_pv_strings(regs):
     """Decode the 31025 per-string block into [{"v", "a", "w"}, ...].
 
@@ -238,6 +253,24 @@ def decode_pv_strings(regs):
     read), so a bigger inverter reporting 6 strings yields the first 4 rather
     than an index error. Anything short or malformed returns [] — an absent
     reading must never fabricate a string at 0 W.
+
+    THE V/I WORDS ARE SIGNED (S16), live-confirmed 03-09-2026. Read as
+    unsigned, a string sitting at its dawn/dusk zero-crossing reported
+    65532-65535 raw — which is -4..-1 as S16, i.e. -0.04..-0.01 A of sensor
+    offset — as 655.32-655.35 A, and V*I then put 215 kW on a 4.275 kWp
+    string. It had done so at dawn and dusk on 21 days since the per-string
+    block shipped, because both the probe that established this block and the
+    test fixture built from it were taken in full sun, where the sign never
+    shows. The official protocol PDF is not to hand; the evidence is the
+    wrap signature itself, which no unsigned reading explains.
+
+    A decoded pair outside PV_STRING_MAX_* means the block is not the shape
+    we think it is, so the WHOLE read is discarded rather than one string
+    patched — a misaligned block has no trustworthy members.
+
+    Watts are floored at 0. A string cannot generate negative power, the
+    small negative current at the zero-crossing is instrument offset, and a
+    negative would subtract from the day's integrated kWh downstream.
     """
     if not regs or len(regs) < 4:
         return []
@@ -250,12 +283,14 @@ def decode_pv_strings(regs):
     out = []
     for i in range(count):
         try:
-            volts = int(regs[2 + i * 2]) / 10.0
-            amps = int(regs[3 + i * 2]) / 100.0
+            volts = _s16(regs[2 + i * 2]) / 10.0
+            amps = _s16(regs[3 + i * 2]) / 100.0
         except (TypeError, ValueError):
             return []
+        if abs(volts) > PV_STRING_MAX_VOLTS or abs(amps) > PV_STRING_MAX_AMPS:
+            return []
         out.append({"v": round(volts, 1), "a": round(amps, 2),
-                    "w": int(round(volts * amps))})
+                    "w": max(0, int(round(volts * amps)))})
     return out
 
 
