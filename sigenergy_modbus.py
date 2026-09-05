@@ -4,8 +4,14 @@
 # Description: Sigenergy inverter Modbus TCP client - reads all registers
 #              and controls battery via Remote EMS
 # Author:      CliveS & Claude Opus 5
-# Date:        03-09-2026
-# Version:     1.13 (READ TIERING — read_all did 29 transactions at the spec's
+# Date:        05-09-2026 12:50
+# Version:     1.14 (LIFETIME ENERGY BLOCKS — load 30094, ESS charge/discharge
+#              30200/30204 probed and added; the four plant energy reads become
+#              four BLOCK reads; reset-type daily registers are never served from
+#              the slow cache (a ten-minute-old daily counter spanning midnight is
+#              from a different day, which froze homeDailyKwh on 4/5-Sep-2026);
+#              data['_energyReadAt'] stamps a cycle that read the counters fresh)
+#              prior 1.13 (READ TIERING — read_all did 29 transactions at the spec's
 #              1s spacing, so a poll took 43s MEASURED however pollInterval was
 #              set, and the flow figures came from instants seconds apart while
 #              homePowerWatts is derived from three of them. Critical reads now
@@ -78,6 +84,10 @@ PLANT_ESS_DISCHARGE_CUTOFF = 30086    # U16, gain 10, %
 PLANT_ESS_SOH              = 30087    # U16, gain 10, % (weighted average)
 PLANT_PV_TOTAL_KWH         = 30088    # U64 (4 regs), gain 100, kWh — LIFETIME PV generation
 PLANT_LOAD_DAILY_KWH       = 30092    # U32 (2 regs), gain 100, kWh — daily reset at midnight
+PLANT_LOAD_TOTAL_KWH       = 30094    # U64 (4 regs), gain 100, kWh — LIFETIME load consumption
+                                      #   (probed 05-Sep-2026: +0.020 kWh in 90 s at ~900 W)
+PLANT_ESS_CHARGE_TOTAL_KWH    = 30200 # U64 (4 regs), gain 100, kWh — LIFETIME ESS charge (probed 05-Sep-2026)
+PLANT_ESS_DISCHARGE_TOTAL_KWH = 30204 # U64 (4 regs), gain 100, kWh — LIFETIME ESS discharge (probed 05-Sep-2026)
 PLANT_TOTAL_IMPORT_KWH     = 30216    # U64 (4 regs), gain 100, kWh — LIFETIME grid import
 PLANT_TOTAL_EXPORT_KWH     = 30220    # U64 (4 regs), gain 100, kWh — LIFETIME grid export
 
@@ -328,6 +338,82 @@ SLOW_READS_PER_CYCLE = 3
 # gap rather than an hour-old number presented as current.
 SLOW_CACHE_MAX_AGE_S = 600
 
+# Registers that RESET (the plant's daily counters). A cached value is a real
+# reading that is merely old, which is fine for a level and wrong for anything
+# with a discontinuity: a ten-minute-old daily counter that spans midnight is
+# not old, it is from a different day. These keys are present in read_all()'s
+# dict ONLY on a cycle they were actually read (v1.14 — the 4/5-Sep-2026 freeze).
+NO_CACHE_KEYS = frozenset((
+    "homeDailyDirectKwh", "batteryDailyChargeKwh", "batteryDailyDischargeKwh",
+))
+
+# The four plant energy blocks (slow tier). mark_slow_read_due(*ENERGY_BLOCK_KEYS)
+# forces a fresh read of every lifetime counter on the next cycle — the plugin
+# does that at local midnight so the day's anchor comes from a post-midnight read.
+ENERGY_BLOCK_KEYS = ("_energyA", "_energyB", "_energyC", "_energyD")
+
+# A U64 lifetime counter above this is a sentinel decode, not a reading.
+MAX_PLAUSIBLE_LIFETIME_KWH = 1.0e8
+
+
+def decode_u64_words(regs, offset=0):
+    """Big-endian U64 from four raw words at `offset`, or None if short/malformed."""
+    if not regs or len(regs) < offset + 4:
+        return None
+    try:
+        return ((int(regs[offset]) << 48) | (int(regs[offset + 1]) << 32)
+                | (int(regs[offset + 2]) << 16) | int(regs[offset + 3]))
+    except (TypeError, ValueError):
+        return None
+
+
+def decode_u32_words(regs, offset=0):
+    """Big-endian U32 from two raw words at `offset`, or None if short/malformed."""
+    if not regs or len(regs) < offset + 2:
+        return None
+    try:
+        return (int(regs[offset]) << 16) | int(regs[offset + 1])
+    except (TypeError, ValueError):
+        return None
+
+
+def _kwh100(raw):
+    """A gain-100 kWh counter as float, or None for a sentinel-sized decode."""
+    if raw is None:
+        return None
+    kwh = round(raw / 100.0, 2)
+    return kwh if kwh < MAX_PLAUSIBLE_LIFETIME_KWH else None
+
+
+def decode_energy_block_a(regs):
+    """30088-30093: PV lifetime (U64) then load DAILY (U32). Both or nothing."""
+    pv, daily = _kwh100(decode_u64_words(regs, 0)), _kwh100(decode_u32_words(regs, 4))
+    if pv is None or daily is None:
+        return None
+    return {"pvLifetimeKwh": pv, "homeDailyDirectKwh": daily}
+
+
+def decode_energy_block_b(regs):
+    """30094-30097: load LIFETIME (U64)."""
+    home = _kwh100(decode_u64_words(regs, 0))
+    return None if home is None else {"homeLifetimeKwh": home}
+
+
+def decode_energy_block_c(regs):
+    """30200-30207: ESS charge lifetime then ESS discharge lifetime (U64 each)."""
+    chg, dis = _kwh100(decode_u64_words(regs, 0)), _kwh100(decode_u64_words(regs, 4))
+    if chg is None or dis is None:
+        return None
+    return {"batteryChargeLifetimeKwh": chg, "batteryDischargeLifetimeKwh": dis}
+
+
+def decode_energy_block_d(regs):
+    """30216-30223: grid import lifetime then grid export lifetime (U64 each)."""
+    imp, exp = _kwh100(decode_u64_words(regs, 0)), _kwh100(decode_u64_words(regs, 4))
+    if imp is None or exp is None:
+        return None
+    return {"gridImportLifetimeKwh": imp, "gridExportLifetimeKwh": exp}
+
 
 def decode_s32_pair(regs):
     """Decode 4 raw U16 words into two signed 32-bit values.
@@ -421,6 +507,12 @@ class SigenergyModbus:
         # debug line — every cycle for ever. A restart re-probes.
         self._pv_strings_absent    = False
         self._pv_strings_misses    = 0
+        # v1.14: the same latch for the two energy blocks that are NEW to this
+        # plugin (30094 load lifetime, 30200/30204 ESS lifetime). Block A (30088)
+        # and D (30216) have been read since v1.0 and carry no latch: a firmware
+        # without them has bigger problems than a missing daily figure.
+        self._energy_block_misses  = {"_energyB": 0, "_energyC": 0}
+        self._energy_block_absent  = set()
 
         # Read tiering (v1.13). _slow_cache holds the last good value of every
         # slow register with the monotonic time it was read; _slow_cursor is
@@ -843,19 +935,17 @@ class SigenergyModbus:
              lambda v: None if v == 0xFFFFFFFF else round(v / 100.0, 2)),
             ("gridCurrentA", self._read_uint32, INV_PHASE_A_CURRENT, inv,
              lambda v: None if v == 0xFFFFFFFF else round(v / 100.0, 2)),
-            # Plant energy. pvLifetimeKwh / gridImport / gridExport are
-            # LIFETIME totals; plugin.py computes daily values as
-            # (current - start-of-day snapshot). homeDailyDirectKwh (30092)
-            # resets at midnight on the inverter — read directly.
-            ("pvLifetimeKwh", self._read_uint64, PLANT_PV_TOTAL_KWH, None,
-             lambda v: round(v / 100.0, 2)),
-            ("homeDailyDirectKwh", self._read_uint32, PLANT_LOAD_DAILY_KWH, None,
-             lambda v: round(v / 100.0, 2)),
-            ("gridImportLifetimeKwh", self._read_uint64, PLANT_TOTAL_IMPORT_KWH, None,
-             lambda v: round(v / 100.0, 2)),
-            ("gridExportLifetimeKwh", self._read_uint64, PLANT_TOTAL_EXPORT_KWH, None,
-             lambda v: round(v / 100.0, 2)),
+            # Plant energy (v1.14): four BLOCK reads, one transaction each, in
+            # place of four single reads. Every value is a LIFETIME counter except
+            # homeDailyDirectKwh (30092), which rides along in block A because it
+            # sits between the PV and load totals. daily_energy.py anchors the
+            # lifetime counters at local midnight; the daily ones are never cached.
+            ("_energyA", "block", (PLANT_PV_TOTAL_KWH, 6), None, decode_energy_block_a),
+            ("_energyB", "block", (PLANT_LOAD_TOTAL_KWH, 4), None, decode_energy_block_b),
+            ("_energyC", "block", (PLANT_ESS_CHARGE_TOTAL_KWH, 8), None, decode_energy_block_c),
+            ("_energyD", "block", (PLANT_TOTAL_IMPORT_KWH, 8), None, decode_energy_block_d),
         ]
+        specs = [s for s in specs if s[0] not in self._energy_block_absent]
         if not self._pv_strings_absent:
             specs.append(("pvStrings", None, None, None, None))
         return specs
@@ -903,14 +993,54 @@ class SigenergyModbus:
                 else:
                     errors += 1
                 continue
+            if reader == "block":
+                # v1.14: one transaction, several keys. `post` decodes the raw
+                # words into {data_key: value} or None for a failed/short read.
+                addr, count = register
+                raw    = self._read_block_u16(addr, count, slave=slave)
+                values = None if raw is None else post(raw)
+                if not values:
+                    errors += 1
+                    self._note_energy_block_miss(key)
+                    continue
+                if key in self._energy_block_misses:
+                    self._energy_block_misses[key] = 0
+                for dkey, value in values.items():
+                    data[dkey] = value
+                    if dkey not in NO_CACHE_KEYS:
+                        self._slow_cache[dkey] = (value, time.monotonic())
+                if key.startswith("_energy"):
+                    data["_energyReadAt"] = time.time()
+                continue
             raw = reader(register) if slave is None else reader(register, slave=slave)
             value = None if raw is None else post(raw)
             if value is None:
                 errors += 1
             else:
                 data[key] = value
-                self._slow_cache[key] = (value, time.monotonic())
+                if key not in NO_CACHE_KEYS:
+                    self._slow_cache[key] = (value, time.monotonic())
         return len(due), errors
+
+    def _note_energy_block_miss(self, key):
+        """Absent-latch for the two energy blocks new in v1.14 (see __init__).
+
+        Three consecutive failures of ONLY that block on a healthy link latch it
+        off for the life of the process. daily_energy.py then derives the house
+        figure from the identity and battery flow from the inverter's own daily
+        counters — labelled, never invented. A restart re-probes.
+        """
+        if key not in self._energy_block_misses or not self._connected:
+            return
+        self._energy_block_misses[key] += 1
+        if self._energy_block_misses[key] >= 3 and key not in self._energy_block_absent:
+            self._energy_block_absent.add(key)
+            what = {"_energyB": "load lifetime register (30094)",
+                    "_energyC": "ESS charge/discharge lifetime registers (30200/30204)"}[key]
+            self.logger.info(
+                f"{what} not answering on this inverter — that block is disabled "
+                f"until the next plugin restart; the daily figure falls back to "
+                f"the identity / the inverter's own daily counters.")
 
     def read_all(self, force_full=False):
         """Read the current registers and return a data dict.
@@ -929,6 +1059,14 @@ class SigenergyModbus:
           batteryDailyDischargeKwh, batteryTempC, batteryCellVoltage,
           batteryMaxTempC, batteryMinTempC, homePowerWatts,
           modbusConnected, lastUpdate,
+          pvLifetimeKwh, homeLifetimeKwh, gridImportLifetimeKwh,
+          gridExportLifetimeKwh, batteryChargeLifetimeKwh,
+          batteryDischargeLifetimeKwh (v1.14 — lifetime counters, cached
+          between rotations like any slow key),
+          homeDailyDirectKwh / batteryDailyChargeKwh / batteryDailyDischargeKwh
+          (RESET-type: present ONLY on a cycle they were read — never cached),
+          _energyReadAt (epoch seconds; present only on a cycle that read a
+          lifetime block fresh),
           pvStrings (v1.8 — [{v, a, w}, ...] per PV string; key absent when
           the block fails or the firmware lacks it, never an empty guess)
         """
