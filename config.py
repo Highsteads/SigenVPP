@@ -5,12 +5,42 @@
 #              No Indigo, no Claude — plain Python, runs anywhere.
 # Author:      CliveS & Claude Opus 4.8
 # Date:        15-06-2026
-# Version:     0.1
+# Version:     0.2
+#
+# v0.2 (20-09-2026) — two ways a config could look fine and not work:
+#   * a token pasted with a trailing newline passed is_configured() and then got
+#     a 401 from Axle. Trimming is done ON LOAD, not at the check, because
+#     trimming only at the check would make setup say yes while the daemon still
+#     sent the untrimmed value.
+#   * a corrupt config.json raised a bare JSONDecodeError out of load_config()
+#     naming no file. It now raises ConfigError with the path, the line and
+#     column, and what to do about it.
 
 import json
 import os
 
 CONFIG_FILENAME = "config.json"
+
+
+class ConfigError(Exception):
+    """A config.json that exists but cannot be used.
+
+    Carries the path and a plain-English reason so the daemon prints one line
+    rather than a traceback. Deliberately NOT a fall back to defaults: running
+    on DEFAULTS after failing to read the user's file would drive the inverter
+    to a 4 kW export target and a 10% reserve that nobody chose, and the only
+    sign would be a log line nobody reads. Refusing to start is the safe answer.
+    """
+
+
+# Values people paste by hand, which routinely arrive with a trailing newline or
+# a leading space when copied out of a browser or a password manager.
+_TRIM_FIELDS = (
+    ("inverter", "ip"),
+    ("vpp",      "axle_token"),
+    ("notify",   "pushover_token"),
+    ("notify",   "pushover_user"),
+)
 
 # Defaults. The setup wizard fills inverter.ip + vpp.axle_token (the only two the
 # user must supply) and auto-detects vpp.export_target_kw from the inverter where
@@ -60,6 +90,20 @@ def _deep_merge(base, override):
     return out
 
 
+def _trim_pasted_fields(cfg):
+    """Strip surrounding whitespace from the hand-pasted values, in place.
+
+    Done on LOAD so every consumer sees the clean value. Doing it in
+    is_configured() instead would fix only the check: setup would report the
+    daemon ready and Axle would still answer 401 for the untrimmed token.
+    """
+    for section, key in _TRIM_FIELDS:
+        sect = cfg.get(section)
+        if isinstance(sect, dict) and isinstance(sect.get(key), str):
+            sect[key] = sect[key].strip()
+    return cfg
+
+
 def config_path(directory=None):
     """Absolute path to config.json next to this script (or in `directory`)."""
     base = directory or os.path.dirname(os.path.abspath(__file__))
@@ -67,13 +111,45 @@ def config_path(directory=None):
 
 
 def load_config(path=None):
-    """Load config.json merged over DEFAULTS. Returns (config_dict, exists_bool)."""
+    """Load config.json merged over DEFAULTS. Returns (config_dict, exists_bool).
+
+    A MISSING file is normal — that is the (defaults, False) case the wizard
+    starts from. A file that exists and cannot be used raises ConfigError, which
+    names the path and says what to do; see that class for why this never falls
+    back to defaults.
+    """
     path = path or config_path()
     if not os.path.exists(path):
-        return _deep_merge(DEFAULTS, {}), False
-    with open(path, encoding="utf-8") as fh:
-        user = json.load(fh)
-    return _deep_merge(DEFAULTS, user), True
+        return _trim_pasted_fields(_deep_merge(DEFAULTS, {})), False
+
+    try:
+        with open(path, encoding="utf-8") as fh:
+            user = json.load(fh)
+    except json.JSONDecodeError as exc:
+        raise ConfigError(
+            f"{path} is not valid JSON — {exc.msg}, line {exc.lineno} column {exc.colno}. "
+            f"Fix it by hand, or delete it and run:  python3 sigen_vpp.py --setup"
+        ) from exc
+    except UnicodeDecodeError as exc:
+        raise ConfigError(
+            f"{path} is not readable as UTF-8 text ({exc.reason}). "
+            f"Delete it and run:  python3 sigen_vpp.py --setup"
+        ) from exc
+    except OSError as exc:
+        raise ConfigError(
+            f"{path} could not be read — {exc.strerror}."
+        ) from exc
+
+    # Valid JSON is not necessarily a config: a bare list or string would reach
+    # _deep_merge and die on .items() with a message about neither the file nor
+    # the problem.
+    if not isinstance(user, dict):
+        raise ConfigError(
+            f"{path} must hold a JSON object, not a {type(user).__name__}. "
+            f"Delete it and run:  python3 sigen_vpp.py --setup"
+        )
+
+    return _trim_pasted_fields(_deep_merge(DEFAULTS, user)), True
 
 
 def save_config(cfg, path=None):
@@ -91,5 +167,16 @@ def save_config(cfg, path=None):
 
 
 def is_configured(cfg):
-    """True once the two required fields are present."""
-    return bool(cfg["inverter"]["ip"]) and bool(cfg["vpp"]["axle_token"])
+    """True once the two required fields hold something other than whitespace.
+
+    load_config() has already trimmed them; this strips again so a config built
+    by hand in a test or a script gets the same answer, and tolerates a section
+    that a hand-edited file replaced with a scalar.
+    """
+    def _filled(section, key):
+        sect = cfg.get(section)
+        if not isinstance(sect, dict):
+            return False
+        return bool(str(sect.get(key) or "").strip())
+
+    return _filled("inverter", "ip") and _filled("vpp", "axle_token")

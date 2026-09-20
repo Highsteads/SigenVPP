@@ -473,14 +473,23 @@ def main():
     args = p.parse_args()
 
     _setup_logging(args.verbose)
-    if args.setup:
-        return cmd_setup(args)
-    if args.status:
-        return cmd_status(args)
-    if getattr(args, "test_export"):
-        return cmd_test_export(args)
-    if args.run:
-        return cmd_run(args)
+
+    # Every command starts by loading config.json, so catch a bad one ONCE here
+    # rather than in each of the four. ConfigError already reads as a finished
+    # sentence naming the file and the fix, so it is printed as-is — a traceback
+    # would bury it.
+    try:
+        if args.setup:
+            return cmd_setup(args)
+        if args.status:
+            return cmd_status(args)
+        if getattr(args, "test_export"):
+            return cmd_test_export(args)
+        if args.run:
+            return cmd_run(args)
+    except cfgmod.ConfigError as exc:
+        print(f"Configuration problem: {exc}")
+        return 1
     return 1
 
 
