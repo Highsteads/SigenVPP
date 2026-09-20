@@ -4,7 +4,7 @@
 # Description: Axle VPP REST API client - polls for export event schedule
 # Author:      CliveS & Claude Fable 5
 # Date:        30-07-2026
-# Version:     1.5
+# Version:     1.6
 #
 # Adapted from SigenergySolar v3.1 axle_api.py
 # Changes: Updated logger name to SigenEnergyManager; _parse_dt guards non-string input
@@ -17,6 +17,13 @@
 #          feed is the normal state, so at INFO they wrote ~140 lines a day to
 #          the Indigo event log saying nothing had happened. Failures still log
 #          at ERROR/WARNING, so an unhealthy feed is as visible as it ever was.
+#          v1.6 — those three lines now log only on a STATE CHANGE. Dropping
+#          them to DEBUG cleared the event log but not the plugin log, where
+#          they were still 142-146 identical rows a day (measured 17/18/19-09-2026:
+#          146, 143, 142 — about 1% of the file, not the bulk of it). Entering the
+#          quiet state is logged once, a switch between the three quiet shapes is
+#          logged (they mean different things upstream), and finding an event
+#          re-arms it.
 
 import logging
 import requests
@@ -72,6 +79,39 @@ class AxleAPI:
         # returns None both for "no event scheduled" and for a failed call, so
         # without this a revoked token is indistinguishable from a quiet day.
         self.last_error = None
+        # Which "no event scheduled" shape the LAST poll saw, else None. Carries
+        # the shape rather than a bare bool because the three shapes mean
+        # different things upstream, so a switch between them is real news.
+        # Not persisted: a fresh process re-announcing the current state at its
+        # first poll is wanted, since the log is the record of what this run is
+        # doing. See _log_no_event().
+        self._last_quiet_shape = None
+
+    def _log_no_event(self, shape):
+        """Log "no event scheduled" only when that state is ENTERED or changes shape.
+
+        The poll runs every ~10 minutes and a quiet feed is the NORMAL state, so
+        an unconditional line wrote 142-146 identical rows a day (measured over
+        17/18/19-09-2026) saying nothing had happened. The shape strings are fixed
+        — no timestamp, no counter — so the key actually matches on the next pass.
+
+        Deliberately NOT reset by the error branches: a quiet -> failure -> quiet
+        round trip is already reported by the plugin's own poll-outcome tracking
+        ("Axle poll failing" / "Axle poll recovered"), so re-announcing the quiet
+        state here would duplicate it.
+
+        LOAD-BEARING INVARIANT: this only works because the caller holds ONE
+        AxleAPI for the life of the plugin host. plugin.py builds it in
+        _init_modules(), called from startup() and again from
+        closedPrefsConfigUi() — never from the poll loop. Move the construction
+        into the loop and the latch resets on every poll, the guard silently
+        does nothing, and the 142-146 lines a day come straight back with no
+        error and no failing test to say so.
+        """
+        if self._last_quiet_shape == shape:
+            return
+        self._last_quiet_shape = shape
+        self.logger.debug(f"Axle poll: no event scheduled ({shape})")
 
     def get_next_event(self):
         """Fetch the next VPP event from the Axle API.
@@ -123,7 +163,7 @@ class AxleAPI:
                 return None
 
             if response.status_code == 204 or not response.content:
-                self.logger.debug("Axle poll: no event scheduled (204 / empty body)")
+                self._log_no_event("204 / empty body")
                 return None
 
             try:
@@ -134,7 +174,7 @@ class AxleAPI:
                 return None
 
             if not data:
-                self.logger.debug("Axle poll: no event scheduled (null response)")
+                self._log_no_event("null response")
                 return None
 
             # Axle says "no event scheduled" in TWO shapes. A null body (above),
@@ -151,7 +191,7 @@ class AxleAPI:
             # and still an error — that distinction is the point of doing this
             # here rather than widening the guard below.
             if data.get("start_time") is None and data.get("end_time") is None:
-                self.logger.debug("Axle poll: no event scheduled (all-null event object)")
+                self._log_no_event("all-null event object")
                 return None
 
             start_time = self._parse_dt(data.get("start_time"))
@@ -187,6 +227,8 @@ class AxleAPI:
                 # Fallback formats the UTC datetimes — label them honestly.
                 _s, _e = start_time.strftime("%H:%M"), end_time.strftime("%H:%M")
                 _lbl   = "UTC"
+            # An event ends the quiet spell, so the next one is logged again.
+            self._last_quiet_shape = None
             self.logger.debug(
                 f"Axle event: {data.get('import_export', '?')} "
                 f"{_s} - {_e} {_lbl} ({duration_hrs:.1f}h)"
