@@ -1,0 +1,9 @@
+# SigenVPP runs outside Indigo, so nothing is pre-installed for it — unlike the
+# plugin, where Indigo bundles requests itself. These are the two the README has
+# always told people to install by hand; having them here means CI proves on
+# every push that they are still installable, which nothing checked before.
+# Deliberately unpinned: the daemon uses long-stable surfaces of both, and a pin
+# here would need chasing for no gain. If a release ever breaks it, pin it THEN
+# and say which version and why.
+pymodbus
+requests

@@ -1,0 +1,66 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+
+      # The shared modules' MASTER lives in the plugin repo, so the gate that
+      # matters here cannot run without it. Both repos are public, so no token.
+      - name: Check out the SigenEnergyManager master
+        uses: actions/checkout@v6
+        with:
+          repository: Highsteads/SigenEnergyManager
+          path: _master
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      # Installing the real dependencies is also the only thing that has ever
+      # checked requirements.txt is installable.
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Install lint tools
+        run: pip install ruff
+
+      # NB every step below is its own `run:` with no `&&` chain and no pipe
+      # after the command. `cmd && echo ok` under `set -e` and `cmd | tail` both
+      # swallow a non-zero exit, which makes a gate that cannot fail.
+      - name: Byte-compile every module
+        run: python -m compileall -q .
+
+      - name: Lint (ruff, errors only)
+        run: ruff check .
+
+      # compileall proves a file parses; it does not prove the package imports.
+      - name: Import every module
+        run: |
+          python -c "
+          import importlib, sys
+          for m in ('config', 'axle_api', 'sigenergy_modbus', 'vpp_controller', 'web_dashboard'):
+              importlib.import_module(m)
+              print('imported', m)
+          "
+
+      # THE gate this repo exists to have. SigenVPP carries byte-identical
+      # copies of two modules whose master is the plugin; they drifted for two
+      # days in Sept 2026 with nothing to notice. Exit 1 = drift, exit 2 = the
+      # master could not be read — both fail the job, because a check that
+      # silently checked nothing is worse than no check.
+      - name: Shared modules match the SigenEnergyManager master
+        env:
+          SIGEN_PLUGIN_SRC: ${{ github.workspace }}/_master/SigenEnergyManager.indigoPlugin/Contents/Server Plugin
+        run: python tools/check_shared_modules.py

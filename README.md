@@ -37,7 +37,7 @@ Remote EMS. Either run this on a machine that does *not* also run the plugin's V
 
 ```bash
 python3 -m venv venv && . venv/bin/activate        # Windows: venv\Scripts\activate
-pip install pymodbus requests
+pip install -r requirements.txt        # pymodbus and requests
 ```
 
 ## Set it up
