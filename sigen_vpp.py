@@ -85,6 +85,43 @@ def _fmt_local(start, end):
         return f"{start:%d %b %H:%M}–{end:%H:%M} UTC"
 
 
+def window_phase(event, now, lead_min, trail_min, precharge_min):
+    """Where `now` sits relative to an Axle export window. PURE — no clock, no I/O.
+
+    Lifted out of cmd_run's loop so the single most safety-critical decision in the
+    daemon (when to start and stop forcing the inverter) can be tested without live
+    hardware. Returns (in_window, in_precharge, ev_state_or_None); `event` of None
+    gives (False, False, None).
+
+    The two boundaries are deliberately asymmetric — `drive_from <= now < drive_until`
+    — so a window is entered on the tick that reaches it and released on the tick that
+    passes it, and two adjacent windows can never both be active.
+
+    All arithmetic is on timezone-aware UTC datetimes. The local clock is used ONLY
+    for the human string, so a BST/GMT change cannot move a window: the tests cover
+    both seasons because that is the bug this shape prevents.
+    """
+    if not event:
+        return False, False, None
+
+    start, end   = event["start_time"], event["end_time"]
+    drive_from   = start - timedelta(minutes=lead_min)
+    drive_until  = end + timedelta(minutes=trail_min)
+    precharge_at = start - timedelta(minutes=precharge_min)
+
+    in_window    = drive_from <= now < drive_until
+    # Pre-charge stops where driving begins, so the two are mutually exclusive.
+    in_precharge = precharge_at <= now < drive_from
+
+    return in_window, in_precharge, {
+        "start": start.isoformat(), "end": end.isoformat(),
+        "local": _fmt_local(start, end),
+        "duration_hrs": round(event["duration_hrs"], 2),
+        "starts_in_s": max(0, (drive_from - now).total_seconds()),
+        "active": in_window,
+    }
+
+
 # ============================================================
 # Helpers
 # ============================================================
@@ -382,22 +419,7 @@ def cmd_run(args):
 
         # 3. Work out where we are relative to the window
         now = datetime.now(timezone.utc)
-        ev_state = None
-        in_window = in_precharge = False
-        if event:
-            start, end = event["start_time"], event["end_time"]
-            drive_from  = start - timedelta(minutes=lead)
-            drive_until = end + timedelta(minutes=trail)
-            precharge_at = start - timedelta(minutes=pre)
-            in_window    = drive_from <= now < drive_until
-            in_precharge = precharge_at <= now < drive_from
-            ev_state = {
-                "start": start.isoformat(), "end": end.isoformat(),
-                "local": _fmt_local(start, end),
-                "duration_hrs": round(event["duration_hrs"], 2),
-                "starts_in_s": max(0, (drive_from - now).total_seconds()),
-                "active": in_window,
-            }
+        in_window, in_precharge, ev_state = window_phase(event, now, lead, trail, pre)
         state.update(next_event=ev_state)
 
         # 4. Act

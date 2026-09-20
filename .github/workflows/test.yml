@@ -33,8 +33,8 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Install lint tools
-        run: pip install ruff
+      - name: Install test tools
+        run: pip install pytest ruff
 
       # NB every step below is its own `run:` with no `&&` chain and no pipe
       # after the command. `cmd && echo ok` under `set -e` and `cmd | tail` both
@@ -54,6 +54,14 @@ jobs:
               importlib.import_module(m)
               print('imported', m)
           "
+
+      # The suite covers what is UNIQUE to the daemon: config handling, the export
+      # controller, the window arithmetic and the dashboard. The two SHARED modules
+      # are tested against their master in the plugin repo and pinned byte-identical
+      # by the step below — testing them twice would just give the copies somewhere
+      # to drift.
+      - name: Tests
+        run: python -m pytest tests -q
 
       # THE gate this repo exists to have. SigenVPP carries byte-identical
       # copies of two modules whose master is the plugin; they drifted for two
