@@ -3,9 +3,17 @@
 # Filename:    sigenergy_modbus.py
 # Description: Sigenergy inverter Modbus TCP client - reads all registers
 #              and controls battery via Remote EMS
-# Author:      CliveS & Claude Opus 5
-# Date:        18-09-2026 06:20
-# Version:     1.15 (set_discharge_limit() logs at INFO only when the value
+# Author:      CliveS & Claude Opus 5; Claude Opus 5.5 (1.16)
+# Date:        22-09-2026 23:10
+# Version:     1.16 (a read cycle cut short by the OWNER'S OWN disconnect() is
+#              not a Modbus fault. A prefs save rebuilds the client while a
+#              poll is mid-cycle on the old one; every remaining read then
+#              failed and the quality check logged "Too many Modbus errors
+#              (7/8) - marking disconnected" at ERROR, which paged CliveS for
+#              nothing (22-09-2026 21:54). disconnect() now latches
+#              _closed_on_purpose, connect() clears it, and the check logs
+#              that case at DEBUG.)
+#              prior 1.15 (set_discharge_limit() logs at INFO only when the value
 #              CHANGES, DEBUG when the same value is re-asserted. The Flux
 #              controller re-writes its floor every tick, so the first
 #              overnight window wrote 381 identical INFO lines into the event
@@ -497,6 +505,7 @@ class SigenergyModbus:
         self.logger           = logger or logging.getLogger("SigenEnergyManager.Modbus")
         self.client           = None
         self._connected       = False
+        self._closed_on_purpose = False   # set by disconnect(), cleared by connect()
         self._lock            = threading.RLock()   # serialises primitives (see _locked)
         self._last_connect_attempt = 0
         # Reconnect delay escalates 30s -> 60s -> 120s (capped) while the
@@ -591,6 +600,7 @@ class SigenergyModbus:
 
             result = self.client.connect()
             if result:
+                self._closed_on_purpose = False
                 # Tentatively connected — verify the application layer with a
                 # probe read before declaring healthy.
                 self._connected = True
@@ -636,6 +646,7 @@ class SigenergyModbus:
             except Exception:
                 pass
         self._connected = False
+        self._closed_on_purpose = True
         self._last_discharge_limit_w = None
         self.logger.info("Disconnected from Sigenergy inverter")
 
@@ -1156,8 +1167,16 @@ class SigenergyModbus:
         # it, two transient failures out of five would drop the connection
         # where the old cycle needed fifteen.
         if total_errors > max(3, attempted // 2):
-            self.logger.error(
-                f"Too many Modbus errors ({total_errors}/{attempted}) - marking disconnected")
+            if self._closed_on_purpose:
+                # disconnect() ran while this cycle was in flight — the owner
+                # closed the socket (a prefs-save rebuild), the inverter did not
+                # fail. Nothing to page anyone about (v1.16).
+                self.logger.debug(
+                    f"Read cycle abandoned ({total_errors}/{attempted} reads "
+                    f"failed): the connection was closed by the plugin")
+            else:
+                self.logger.error(
+                    f"Too many Modbus errors ({total_errors}/{attempted}) - marking disconnected")
             self._connected = False
             # Stamp the attempt clock so the next poll honours the reconnect
             # delay instead of instantly re-running a failed cycle.
