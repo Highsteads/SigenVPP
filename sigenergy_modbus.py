@@ -3,9 +3,16 @@
 # Filename:    sigenergy_modbus.py
 # Description: Sigenergy inverter Modbus TCP client - reads all registers
 #              and controls battery via Remote EMS
-# Author:      CliveS & Claude Opus 5; Claude Opus 5.5 (1.16)
-# Date:        22-09-2026 23:10
-# Version:     1.16 (a read cycle cut short by the OWNER'S OWN disconnect() is
+# Author:      CliveS & Claude Opus 5; Claude Opus 5.5 (1.16, 1.17)
+# Date:        27-09-2026 21:40
+# Version:     1.17 (force_charge(pv_first=True) selects Command Charging PV
+#              First (0x04) instead of Grid First (0x03). Measured live on
+#              27-09-2026: in 0x03 the inverter drew the whole 10 kW charge
+#              from the grid and held the panels at 0 W for two hours, string
+#              voltages rising to near open circuit, because Grid First only
+#              lets PV fill what the grid import cap cannot. The default stays
+#              0x03 so SigenVPP, which shares this file, is unchanged.)
+#              prior 1.16 (a read cycle cut short by the OWNER'S OWN disconnect() is
 #              not a Modbus fault. A prefs save rebuilds the client while a
 #              poll is mid-cycle on the old one; every remaining read then
 #              failed and the quality check logged "Too many Modbus errors
@@ -1457,10 +1464,18 @@ class SigenergyModbus:
     # Convenience Methods
     # ================================================================
 
-    def force_charge(self, power_watts=10000, cutoff_soc=None):
+    def force_charge(self, power_watts=10000, cutoff_soc=None, pv_first=False):
         """Force charge battery from grid at specified power.
 
-        Enables Remote EMS, sets Charge Grid First mode, sets power limit.
+        Enables Remote EMS, sets a Command Charging mode, sets power limit.
+
+        pv_first=False (default) selects Charge Grid First (0x03): the grid
+        supplies the whole charge and the inverter CURTAILS the panels to
+        whatever the grid import cap cannot cover -- in practice to zero
+        (measured 27-09-2026: 10 kW from the grid, PV held at 0 W for two
+        hours). pv_first=True selects Charge PV First (0x04): the panels charge
+        the battery first and the grid tops up to power_watts, so no sun is
+        thrown away. Same charge rate, less grid.
 
         cutoff_soc (optional): also write HOLD_ESS_CHARGE_CUTOFF (40047) as a
         HARDWARE backstop so a plugin crash or Modbus outage mid-import cannot
@@ -1472,10 +1487,11 @@ class SigenergyModbus:
         leave mode 0x03 latched with the plugin believing no import started —
         strictly worse than the pre-backstop behaviour).
         """
-        self.logger.info(f"Force charging from grid at {power_watts}W")
+        source = "solar first, then grid" if pv_first else "grid"
+        self.logger.info(f"Force charging from {source} at {power_watts}W")
         if not self.enable_remote_ems():
             return False
-        if not self.set_remote_ems_mode(0x03):
+        if not self.set_remote_ems_mode(0x04 if pv_first else 0x03):
             return False
         if not self.set_charge_limit(power_watts):
             return False
@@ -1485,7 +1501,7 @@ class SigenergyModbus:
                     "Charge-cutoff backstop write failed — import runs without a "
                     "hardware SOC ceiling (software stop at target still active)"
                 )
-        self.logger.info(f"Force charge active: {power_watts}W from grid")
+        self.logger.info(f"Force charge active: {power_watts}W from {source}")
         return True
 
     def force_discharge(self, power_watts=4000):
