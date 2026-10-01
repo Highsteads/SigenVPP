@@ -3,9 +3,12 @@
 # Filename:    sigenergy_modbus.py
 # Description: Sigenergy inverter Modbus TCP client - reads all registers
 #              and controls battery via Remote EMS
-# Author:      CliveS & Claude Opus 5; Claude Opus 5.5 (1.16, 1.17)
-# Date:        27-09-2026 21:40
-# Version:     1.17 (force_charge(pv_first=True) selects Command Charging PV
+# Author:      CliveS & Claude Opus 5; Claude Opus 5.5 (1.16, 1.17, 1.18)
+# Date:        27-09-2026 21:40; 1.18 01-10-2026
+# Version:     1.18 (set_backup_soc(quiet=True) logs at DEBUG: the Flux executor
+#              moves the floor every few minutes through a peak sale and does its
+#              own read-back. Default unchanged, so SigenVPP is unaffected.)
+#              1.17 (force_charge(pv_first=True) selects Command Charging PV
 #              First (0x04) instead of Grid First (0x03). Measured live on
 #              27-09-2026: in 0x03 the inverter drew the whole 10 kW charge
 #              from the grid and held the panels at 0 W for two hours, string
@@ -1759,8 +1762,11 @@ class SigenergyModbus:
     # ESS SOC Limits (V2.6+ registers)
     # ================================================================
 
-    def set_backup_soc(self, soc_pct):
+    def set_backup_soc(self, soc_pct, quiet=False):
         """Set the ESS backup reserve SOC (register 40046).
+
+        quiet=True logs the write at DEBUG instead of INFO (1.18), for a caller
+        that reads every write back itself and moves the reserve often.
 
         On-grid the battery stops discharging at this SOC in every mode,
         including a forced Remote EMS export (hardware-verified 17-Sep-2026:
@@ -1774,7 +1780,8 @@ class SigenergyModbus:
             self.logger.error(f"Invalid backup SOC: {soc_pct}% (must be 0-100)")
             return False
         raw_value = int(round(soc_pct * 10))
-        self.logger.info(f"Setting ESS backup reserve: {soc_pct:.1f}% (raw={raw_value})")
+        (self.logger.debug if quiet else self.logger.info)(
+            f"Setting ESS backup reserve: {soc_pct:.1f}% (raw={raw_value})")
         success = self._write_single_register(HOLD_ESS_BACKUP_SOC, raw_value)
         if not success:
             self.logger.error(f"Failed to set backup reserve to {soc_pct:.1f}%")
