@@ -3,9 +3,17 @@
 # Filename:    sigenergy_modbus.py
 # Description: Sigenergy inverter Modbus TCP client - reads all registers
 #              and controls battery via Remote EMS
-# Author:      CliveS & Claude Opus 5; Claude Opus 5.5 (1.16, 1.17, 1.18)
-# Date:        27-09-2026 21:40; 1.18 01-10-2026
-# Version:     1.18 (set_backup_soc(quiet=True) logs at DEBUG: the Flux executor
+# Author:      CliveS & Claude Opus 5; Claude Opus 5.5 (1.16, 1.17, 1.18, 1.19)
+# Date:        27-09-2026 21:40; 1.18 01-10-2026; 1.19 02-10-2026
+# Version:     1.19 (review 02-10-2026: a lifetime counter reading exactly 0
+#              decodes as absent — counters not yet loaded after a reboot —
+#              and does not count towards the block absent-latch; every U32
+#              decode rejects the 0xFFFFFFFF sentinel; connect() re-primes the
+#              slow tier so the first snapshot after ANY reconnect is a full
+#              sweep; read_all adds _energyFreshKeys naming the energy keys
+#              read this cycle (_energyReadAt is unchanged); a non-integer
+#              32-bit write is refused with an ERROR instead of raising.)
+#              prior 1.18 (set_backup_soc(quiet=True) logs at DEBUG: the Flux executor
 #              moves the floor every few minutes through a peak sale and does its
 #              own read-back. Default unchanged, so SigenVPP is unaffected.)
 #              1.17 (force_charge(pv_first=True) selects Command Charging PV
@@ -402,6 +410,21 @@ def decode_u32_words(regs, offset=0):
         return None
 
 
+# This firmware's "not applicable" for a U32 (an unused phase answers it). At
+# gain 100 it decodes to 42,949,672.95, which is BELOW the U64 ceiling above, so
+# that ceiling cannot catch it — every U32 decode must reject it by value
+# (review 02-10-2026: a sentinel daily counter used as anchor recovery made
+# today's figure the whole lifetime counter).
+U32_SENTINEL = 0xFFFFFFFF
+
+
+def _u32(raw):
+    """A U32 register value, or None for the 0xFFFFFFFF "not applicable" sentinel."""
+    if raw is None or raw == U32_SENTINEL:
+        return None
+    return raw
+
+
 def _kwh100(raw):
     """A gain-100 kWh counter as float, or None for a sentinel-sized decode."""
     if raw is None:
@@ -410,23 +433,44 @@ def _kwh100(raw):
     return kwh if kwh < MAX_PLAUSIBLE_LIFETIME_KWH else None
 
 
+def _lifetime_kwh100(raw):
+    """A gain-100 LIFETIME counter, or None when it is a sentinel or exactly 0.
+
+    review 02-10-2026: an inverter that has just rebooted can answer before its
+    counters are loaded, and a block of zeros decoded as a valid 0.00 kWh was
+    taken downstream as a meter reset. A plant's lifetime counter is never 0
+    once it has run at all, so 0 means "not loaded", i.e. absent.
+    """
+    kwh = _kwh100(raw)
+    return None if not kwh else kwh
+
+
 def decode_energy_block_a(regs):
-    """30088-30093: PV lifetime (U64) then load DAILY (U32). Both or nothing."""
-    pv, daily = _kwh100(decode_u64_words(regs, 0)), _kwh100(decode_u32_words(regs, 4))
-    if pv is None or daily is None:
+    """30088-30093: PV lifetime (U64) then load DAILY (U32).
+
+    No PV lifetime, no block. A sentinel daily counter is dropped and the
+    lifetime kept (review 02-10-2026) — the daily figure is only ever used
+    to recover an anchor, so its absence costs nothing.
+    """
+    pv = _lifetime_kwh100(decode_u64_words(regs, 0))
+    if pv is None or decode_u32_words(regs, 4) is None:
         return None
+    daily = _kwh100(_u32(decode_u32_words(regs, 4)))
+    if daily is None:
+        return {"pvLifetimeKwh": pv}
     return {"pvLifetimeKwh": pv, "homeDailyDirectKwh": daily}
 
 
 def decode_energy_block_b(regs):
     """30094-30097: load LIFETIME (U64)."""
-    home = _kwh100(decode_u64_words(regs, 0))
+    home = _lifetime_kwh100(decode_u64_words(regs, 0))
     return None if home is None else {"homeLifetimeKwh": home}
 
 
 def decode_energy_block_c(regs):
     """30200-30207: ESS charge lifetime then ESS discharge lifetime (U64 each)."""
-    chg, dis = _kwh100(decode_u64_words(regs, 0)), _kwh100(decode_u64_words(regs, 4))
+    chg = _lifetime_kwh100(decode_u64_words(regs, 0))
+    dis = _lifetime_kwh100(decode_u64_words(regs, 4))
     if chg is None or dis is None:
         return None
     return {"batteryChargeLifetimeKwh": chg, "batteryDischargeLifetimeKwh": dis}
@@ -434,7 +478,8 @@ def decode_energy_block_c(regs):
 
 def decode_energy_block_d(regs):
     """30216-30223: grid import lifetime then grid export lifetime (U64 each)."""
-    imp, exp = _kwh100(decode_u64_words(regs, 0)), _kwh100(decode_u64_words(regs, 4))
+    imp = _lifetime_kwh100(decode_u64_words(regs, 0))
+    exp = _lifetime_kwh100(decode_u64_words(regs, 4))
     if imp is None or exp is None:
         return None
     return {"gridImportLifetimeKwh": imp, "gridExportLifetimeKwh": exp}
@@ -623,6 +668,11 @@ class SigenergyModbus:
                     self._connected = False
                     return False
                 self._reconnect_delay = self._reconnect_delay_base
+                # review 02-10-2026: the first snapshot after ANY connect is a
+                # full sweep, as __init__ promises. Without this an outage longer
+                # than SLOW_CACHE_MAX_AGE_S emptied the cache and the next
+                # snapshots carried only the rotation's three keys.
+                self._slow_primed = False
                 self.logger.info(
                     f"Connected to Sigenergy at {self.ip}:{self.port} "
                     f"(plant={self.plant_address}, inverter={self.inverter_address})"
@@ -944,10 +994,11 @@ class SigenergyModbus:
             ("batterySoh", self._read_uint16, PLANT_ESS_SOH, None,
              lambda v: round(v / 10.0, 1)),
             # Inverter: battery pack
+            # review 02-10-2026: every U32 post rejects the 0xFFFFFFFF sentinel.
             ("batteryDailyChargeKwh", self._read_uint32, INV_DAILY_CHARGE_ENERGY, inv,
-             lambda v: round(v / 100.0, 2)),
+             lambda v: None if _u32(v) is None else round(v / 100.0, 2)),
             ("batteryDailyDischargeKwh", self._read_uint32, INV_DAILY_DISCHARGE_ENERGY, inv,
-             lambda v: round(v / 100.0, 2)),
+             lambda v: None if _u32(v) is None else round(v / 100.0, 2)),
             ("batteryTempC", self._read_int16, INV_BATTERY_AVG_TEMP, inv,
              lambda v: round(v / 10.0, 1)),
             ("batteryCellVoltage", self._read_uint16, INV_BATTERY_AVG_VOLTAGE, inv,
@@ -969,13 +1020,13 @@ class SigenergyModbus:
             ("alarm1Raw", self._read_uint16, INV_ALARM1, inv,
              lambda v: v),
             ("ratedCapacityKwh", self._read_uint32, INV_RATED_CAPACITY_KWH, inv,
-             lambda v: round(v / 100.0, 2)),
+             lambda v: None if _u32(v) is None else round(v / 100.0, 2)),
             # 0xFFFFFFFF is this firmware's "not applicable" for an unused
             # phase, and it decodes to a nonsense 42949672.95 V at face value.
             ("gridVoltageV", self._read_uint32, INV_PHASE_A_VOLTAGE, inv,
-             lambda v: None if v == 0xFFFFFFFF else round(v / 100.0, 2)),
+             lambda v: None if _u32(v) is None else round(v / 100.0, 2)),
             ("gridCurrentA", self._read_uint32, INV_PHASE_A_CURRENT, inv,
-             lambda v: None if v == 0xFFFFFFFF else round(v / 100.0, 2)),
+             lambda v: None if _u32(v) is None else round(v / 100.0, 2)),
             # Plant energy (v1.14): four BLOCK reads, one transaction each, in
             # place of four single reads. Every value is a LIFETIME counter except
             # homeDailyDirectKwh (30092), which rides along in block A because it
@@ -1042,7 +1093,11 @@ class SigenergyModbus:
                 values = None if raw is None else post(raw)
                 if not values:
                     errors += 1
-                    self._note_energy_block_miss(key)
+                    # review 02-10-2026: only a FAILED read is evidence of an
+                    # absent register. A block that answered with counters not
+                    # yet loaded (zeros after a reboot) must not latch it off.
+                    if raw is None:
+                        self._note_energy_block_miss(key)
                     continue
                 if key in self._energy_block_misses:
                     self._energy_block_misses[key] = 0
@@ -1052,6 +1107,12 @@ class SigenergyModbus:
                         self._slow_cache[dkey] = (value, time.monotonic())
                 if key.startswith("_energy"):
                     data["_energyReadAt"] = time.time()
+                    # review 02-10-2026: _energyReadAt says SOME block was read;
+                    # the other lifetime keys in the dict may be cached values up
+                    # to SLOW_CACHE_MAX_AGE_S old. Name the keys actually read so
+                    # the midnight anchor is never taken from a cached one.
+                    data["_energyFreshKeys"] = tuple(sorted(
+                        set(data.get("_energyFreshKeys", ())) | set(values)))
                 continue
             raw = reader(register) if slave is None else reader(register, slave=slave)
             value = None if raw is None else post(raw)
@@ -1108,6 +1169,9 @@ class SigenergyModbus:
           (RESET-type: present ONLY on a cycle they were read — never cached),
           _energyReadAt (epoch seconds; present only on a cycle that read a
           lifetime block fresh),
+          _energyFreshKeys (tuple of the energy data keys actually read this
+          cycle — 1.19; the rest are cache. daily_energy.readings_from_data
+          honours it),
           pvStrings (v1.8 — [{v, a, w}, ...] per PV string; key absent when
           the block fails or the firmware lacks it, never an empty guess)
         """
@@ -1321,6 +1385,14 @@ class SigenergyModbus:
             slave = self.plant_address
         if not self._connected:
             self.logger.error("Cannot write - not connected to inverter")
+            return False
+        # review 02-10-2026: a non-integer used to raise a bare TypeError from
+        # the shift below, outside every handler. Refuse it here, loudly, and
+        # leave the connection alone — a bad argument is not a dead link.
+        if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 0xFFFFFFFF:
+            self.logger.error(
+                f"Refusing to write regs {register}-{register+1}: {value!r} is not "
+                f"an unsigned 32-bit integer")
             return False
         self._throttle()
         high_word = (value >> 16) & 0xFFFF
