@@ -3,9 +3,12 @@
 # Filename:    sigenergy_modbus.py
 # Description: Sigenergy inverter Modbus TCP client - reads all registers
 #              and controls battery via Remote EMS
-# Author:      CliveS & Claude Opus 5; Claude Opus 5.5 (1.16, 1.17, 1.18, 1.19, 1.20)
-# Date:        27-09-2026 21:40; 1.18 01-10-2026; 1.19 02-10-2026; 1.20 28-10-2026
-# Version:     1.20 (28-10-2026: a reconnect skips the full sweep while every
+# Author:      CliveS & Claude Opus 5; Claude Opus 5.5 (1.16, 1.17, 1.18, 1.19, 1.20, 1.21)
+# Date:        27-09-2026 21:40; 1.18 01-10-2026; 1.19 02-10-2026; 1.20 28-10-2026; 1.21 28-10-2026
+# Version:     1.21 (28-10-2026: verify=False on the five setters the Flux executor
+#              drives, which reads every write back itself; one read per register
+#              instead of two, so a hand-back fits Indigo's ~22 s stop budget.)
+# Previous:    1.20 (28-10-2026: a reconnect skips the full sweep while every
 #              cached slow value is younger than half SLOW_CACHE_MAX_AGE_S, and
 #              re-reads only RECONNECT_RECHECK_KEYS on top of a normal cycle, so a
 #              blip costs ~8 s of readings rather than ~31 s.)
@@ -1476,10 +1479,14 @@ class SigenergyModbus:
     # Remote EMS Control
     # ================================================================
 
-    def enable_remote_ems(self):
-        """Enable Remote EMS control (register 40029 = 1)."""
+    def enable_remote_ems(self, verify=True):
+        """Enable Remote EMS control (register 40029 = 1).
+
+        verify=False (1.21) skips the driver's own read-back, for a caller that
+        reads the register back itself (the Flux executor). One read, not two.
+        """
         self.logger.info("Enabling Remote EMS control")
-        success = self._write_single_register(HOLD_REMOTE_EMS_ENABLE, 1)
+        success = self._write_single_register(HOLD_REMOTE_EMS_ENABLE, 1, verify=verify)
         if not success:
             self.logger.error("Failed to enable Remote EMS")
         return success
@@ -1492,14 +1499,14 @@ class SigenergyModbus:
             self.logger.error("Failed to disable Remote EMS")
         return success
 
-    def set_remote_ems_mode(self, mode):
-        """Set Remote EMS control mode (register 40031)."""
+    def set_remote_ems_mode(self, mode, verify=True):
+        """Set Remote EMS control mode (register 40031). verify: see enable_remote_ems."""
         mode_name = REMOTE_EMS_MODES.get(mode, f"Unknown ({mode})")
         if mode not in REMOTE_EMS_MODES:
             self.logger.error(f"Invalid Remote EMS mode: {mode}")
             return False
         self.logger.info(f"Setting Remote EMS mode: {mode_name} (0x{mode:02X})")
-        success = self._write_single_register(HOLD_REMOTE_EMS_MODE, mode)
+        success = self._write_single_register(HOLD_REMOTE_EMS_MODE, mode, verify=verify)
         if not success:
             self.logger.error(f"Failed to set Remote EMS mode: {mode_name}")
         else:
@@ -1530,8 +1537,11 @@ class SigenergyModbus:
             self.logger.debug(f"Setting ESS max charge limit: {watts}W")
         return self._write_uint32_registers(HOLD_ESS_MAX_CHARGE, watts, verify=not quiet)
 
-    def set_discharge_limit(self, watts):
-        """Set ESS max discharging power (registers 40034-40035, watts)."""
+    def set_discharge_limit(self, watts, verify=True):
+        """Set ESS max discharging power (registers 40034-40035, watts).
+
+        verify: see enable_remote_ems.
+        """
         if watts < 0:
             self.logger.error(f"Invalid discharge limit: {watts}W (must be >= 0)")
             return False
@@ -1543,7 +1553,7 @@ class SigenergyModbus:
             self.logger.debug(f"Setting ESS max discharge limit: {watts}W (unchanged)")
         else:
             self.logger.info(f"Setting ESS max discharge limit: {watts}W")
-        success = self._write_uint32_registers(HOLD_ESS_MAX_DISCHARGE, watts)
+        success = self._write_uint32_registers(HOLD_ESS_MAX_DISCHARGE, watts, verify=verify)
         # Only a write we know landed lets us stay quiet about the next one.
         self._last_discharge_limit_w = watts if success else None
         return success
@@ -1869,11 +1879,12 @@ class SigenergyModbus:
     # ESS SOC Limits (V2.6+ registers)
     # ================================================================
 
-    def set_backup_soc(self, soc_pct, quiet=False):
+    def set_backup_soc(self, soc_pct, quiet=False, verify=True):
         """Set the ESS backup reserve SOC (register 40046).
 
         quiet=True logs the write at DEBUG instead of INFO (1.18), for a caller
-        that reads every write back itself and moves the reserve often.
+        that reads every write back itself and moves the reserve often. It does
+        NOT skip the read-back; verify=False does that (1.21).
 
         On-grid the battery stops discharging at this SOC in every mode,
         including a forced Remote EMS export (hardware-verified 17-Sep-2026:
@@ -1889,7 +1900,7 @@ class SigenergyModbus:
         raw_value = int(round(soc_pct * 10))
         (self.logger.debug if quiet else self.logger.info)(
             f"Setting ESS backup reserve: {soc_pct:.1f}% (raw={raw_value})")
-        success = self._write_single_register(HOLD_ESS_BACKUP_SOC, raw_value)
+        success = self._write_single_register(HOLD_ESS_BACKUP_SOC, raw_value, verify=verify)
         if not success:
             self.logger.error(f"Failed to set backup reserve to {soc_pct:.1f}%")
         return success
@@ -1962,7 +1973,7 @@ class SigenergyModbus:
         self.logger.debug(f"Discharge cutoff: {soc_pct:.1f}% (raw={raw})")
         return soc_pct
 
-    def set_charge_cutoff(self, soc_pct):
+    def set_charge_cutoff(self, soc_pct, verify=True):
         """Set ESS maximum charge SOC (register 40047).
 
         HARDWARE-VERIFIED GLOBAL (supervised live test 02-07-2026): with the
@@ -1976,13 +1987,14 @@ class SigenergyModbus:
 
         Args:
             soc_pct: Maximum charge SOC % (0.0 - 100.0)
+            verify:  see enable_remote_ems (1.21)
         """
         if not (0.0 <= soc_pct <= 100.0):
             self.logger.error(f"Invalid charge cutoff: {soc_pct}% (must be 0-100)")
             return False
         raw_value = int(round(soc_pct * 10))
         self.logger.info(f"Setting ESS charge cutoff: {soc_pct:.1f}% (raw={raw_value})")
-        success = self._write_single_register(HOLD_ESS_CHARGE_CUTOFF, raw_value)
+        success = self._write_single_register(HOLD_ESS_CHARGE_CUTOFF, raw_value, verify=verify)
         if not success:
             self.logger.error(f"Failed to set charge cutoff to {soc_pct:.1f}%")
         return success
