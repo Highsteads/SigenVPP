@@ -3,9 +3,13 @@
 # Filename:    sigenergy_modbus.py
 # Description: Sigenergy inverter Modbus TCP client - reads all registers
 #              and controls battery via Remote EMS
-# Author:      CliveS & Claude Opus 5; Claude Opus 5.5 (1.16, 1.17, 1.18, 1.19)
-# Date:        27-09-2026 21:40; 1.18 01-10-2026; 1.19 02-10-2026
-# Version:     1.19 (review 02-10-2026: a lifetime counter reading exactly 0
+# Author:      CliveS & Claude Opus 5; Claude Opus 5.5 (1.16, 1.17, 1.18, 1.19, 1.20)
+# Date:        27-09-2026 21:40; 1.18 01-10-2026; 1.19 02-10-2026; 1.20 28-10-2026
+# Version:     1.20 (28-10-2026: a reconnect skips the full sweep while every
+#              cached slow value is younger than half SLOW_CACHE_MAX_AGE_S, and
+#              re-reads only RECONNECT_RECHECK_KEYS on top of a normal cycle, so a
+#              blip costs ~8 s of readings rather than ~31 s.)
+#              prior 1.19 (review 02-10-2026: a lifetime counter reading exactly 0
 #              decodes as absent — counters not yet loaded after a reboot —
 #              and does not count towards the block absent-latch; every U32
 #              decode rejects the 0xFFFFFFFF sentinel; connect() re-primes the
@@ -371,6 +375,17 @@ SLOW_READS_PER_CYCLE = 3
 # gap rather than an hour-old number presented as current.
 SLOW_CACHE_MAX_AGE_S = 600
 
+# A reconnect after a short drop keeps the slow cache (v1.20, 28-10-2026). On
+# 28-10-2026 the inverter reset the socket twice in four minutes; the plugin
+# was reconnected 0.3 s later, but the first snapshot took ~31 s because every
+# reconnect re-read all ~29 registers at the protocol's 1 s spacing, and for
+# that half-minute the manager and the Zappi export guard saw no readings.
+# While every cached value is younger than half SLOW_CACHE_MAX_AGE_S the
+# rotation can re-read each one before it expires, so the full sweep is
+# skipped and the reconnect cycle is a normal one plus these settings, which
+# an inverter that restarted during the drop may have changed.
+RECONNECT_RECHECK_KEYS = ("emsWorkMode", "dischargeCutoffSoc")
+
 # Registers that RESET (the plant's daily counters). A cached value is a real
 # reading that is merely old, which is fine for a level and wrong for anything
 # with a discontinuity: a ten-minute-old daily counter that spans midnight is
@@ -607,6 +622,9 @@ class SigenergyModbus:
         self._slow_cursor  = 0
         self._slow_primed  = False
         self._slow_due     = set()
+        # The slow keys the last full sweep delivered: a reconnect may skip
+        # the full sweep only while every one of them is still fresh (v1.20).
+        self._primed_keys  = frozenset()
         # sleep_func: callable taking seconds. When called from a plugin thread,
         # pass plugin.sleep so StopThread can interrupt the 1s throttle delay
         # between Modbus requests (read_all does ~16 reads = up to 16s blocking).
@@ -668,11 +686,15 @@ class SigenergyModbus:
                     self._connected = False
                     return False
                 self._reconnect_delay = self._reconnect_delay_base
-                # review 02-10-2026: the first snapshot after ANY connect is a
-                # full sweep, as __init__ promises. Without this an outage longer
-                # than SLOW_CACHE_MAX_AGE_S emptied the cache and the next
-                # snapshots carried only the rotation's three keys.
-                self._slow_primed = False
+                # review 02-10-2026: an outage longer than SLOW_CACHE_MAX_AGE_S
+                # emptied the cache and the next snapshots carried only the
+                # rotation's three keys, so a reconnect re-primes with a full
+                # sweep. v1.20: unless the cache is still fresh enough to carry
+                # every key until the rotation reaches it, as after a blip.
+                if self._slow_cache_warm():
+                    self._slow_due.update(RECONNECT_RECHECK_KEYS)
+                else:
+                    self._slow_primed = False
                 self.logger.info(
                     f"Connected to Sigenergy at {self.ip}:{self.port} "
                     f"(plant={self.plant_address}, inverter={self.inverter_address})"
@@ -690,6 +712,18 @@ class SigenergyModbus:
             self._next_reconnect_delay()
             self.logger.error(f"Modbus connection error: {e}")
             return False
+
+    def _slow_cache_warm(self):
+        """True when every key of the last full sweep is cached and younger
+        than half SLOW_CACHE_MAX_AGE_S, so a reconnect needs no full sweep."""
+        if not self._slow_primed or not self._primed_keys:
+            return False
+        now = time.monotonic()
+        for key in self._primed_keys:
+            entry = self._slow_cache.get(key)
+            if entry is None or now - entry[1] > SLOW_CACHE_MAX_AGE_S / 2:
+                return False
+        return True
 
     def _next_reconnect_delay(self):
         """Escalate the reconnect delay (base -> 2x -> max, capped) and return it."""
@@ -1304,6 +1338,7 @@ class SigenergyModbus:
 
         if full_sweep:
             self._slow_primed = True
+            self._primed_keys = frozenset(self._slow_cache)
 
         if total_errors > 0:
             self.logger.debug(
